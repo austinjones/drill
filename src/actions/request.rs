@@ -100,7 +100,7 @@ impl Request {
     }
   }
 
-  async fn send_request(&self, context: &mut Context, pool: &Pool, config: &Config) -> (Option<Response>, f64) {
+  async fn send_request(&self, context: &mut Context, pool: &Pool, config: &Config) -> (Option<Response>, Instant) {
     let mut uninterpolator = None;
 
     // Resolve the name
@@ -193,14 +193,13 @@ impl Request {
 
     let begin = Instant::now();
     let response_result = client.execute(request).await;
-    let duration_ms = begin.elapsed().as_secs_f64() * 1000.0;
 
     match response_result {
       Err(e) => {
         if !config.quiet || config.verbose {
           println!("Error connecting '{}': {:?}", interpolated_base_url.as_str(), e);
         }
-        (None, duration_ms)
+        (None, begin)
       }
       Ok(response) => {
         if !config.quiet {
@@ -213,10 +212,12 @@ impl Request {
             status.to_string().yellow()
           };
 
+          let duration_ms = begin.elapsed().as_secs_f64() / 1000.0;
+
           println!("{:width$} {} {} {}", interpolated_name.green(), interpolated_base_url.blue().bold(), status_text, Request::format_time(duration_ms, config.nanosec).cyan(), width = 25);
         }
 
-        (Some(response), duration_ms)
+        (Some(response), begin)
       }
     }
   }
@@ -261,7 +262,8 @@ impl Runnable for Request {
       context.insert("index".to_string(), json!(self.index.unwrap()));
     }
 
-    let (res, duration_ms) = self.send_request(context, pool, config).await;
+    let (res, response_start) = self.send_request(context, pool, config).await;
+    let mut duration_ms = response_start.elapsed().as_secs_f64() * 1000.0;
 
     let log_message_response = if config.verbose {
       Some(log_message_response(&res, duration_ms))
@@ -278,12 +280,6 @@ impl Runnable for Request {
       Some(response) => {
         let status = response.status().as_u16();
 
-        reports.push(Report {
-          name: self.name.to_owned(),
-          duration: duration_ms,
-          status,
-        });
-
         for cookie in response.cookies() {
           let cookies = context.entry("cookies").or_insert_with(|| json!({})).as_object_mut().unwrap();
           cookies.insert(cookie.name().to_string(), json!(cookie.value().to_string()));
@@ -297,6 +293,7 @@ impl Runnable for Request {
           });
 
           let data = response.text().await.unwrap();
+          duration_ms = response_start.elapsed().as_secs_f64() * 1000.0;
 
           let body: Value = serde_json::from_str(&data).unwrap_or(serde_json::Value::Null);
 
@@ -312,11 +309,20 @@ impl Runnable for Request {
 
           Some(data)
         } else {
+          let _data: String = response.text().await.unwrap();
+          duration_ms = response_start.elapsed().as_secs_f64() * 1000.0;
+
           None
         };
 
+        reports.push(Report {
+          name: self.name.to_owned(),
+          duration: duration_ms,
+          status,
+        });
+
         if let Some(msg) = log_message_response {
-          log_response(msg, &data)
+          log_response(msg, &data, duration_ms)
         }
       }
     }
@@ -348,11 +354,12 @@ fn log_message_response(response: &Option<reqwest::Response>, duration_ms: f64) 
   message
 }
 
-fn log_response(log_message_response: String, body: &Option<String>) {
+fn log_response(log_message_response: String, body: &Option<String>, duration_ms: f64) {
   let mut message = String::new();
   write!(message, "{}{}", "<<<".bold().green(), log_message_response).unwrap();
   if let Some(body) = body.as_ref() {
-    write!(message, " {} {:?}", "BODY:".bold(), body).unwrap()
+    write!(message, " {} {:?}", "BODY DURATION:".bold(), duration_ms).unwrap();
+    write!(message, " {} {:?}", "BODY:".bold(), body).unwrap();
   }
   println!("{message}");
 }
